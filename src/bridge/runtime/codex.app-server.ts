@@ -93,6 +93,7 @@ export class CodexAppServerClient
   extends EventEmitter
   implements CodexRuntimeClient
 {
+  private static readonly SOCKET_HEARTBEAT_MS = 10_000;
   readonly config: BridgeConfig;
   readonly logger: LoggerLike;
   readonly repoRoot: string;
@@ -101,6 +102,8 @@ export class CodexAppServerClient
   socket: AppServerSocket | null = null;
   requestId = 0;
   ready = false;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private missedHeartbeats = 0;
 
   private readonly pending = new Map<string | number, PendingResolver>();
 
@@ -187,6 +190,8 @@ export class CodexAppServerClient
 
   async stop(): Promise<void> {
     this.ready = false;
+    this.clearHeartbeat();
+    this.rejectAllPending(new Error('Codex app-server stopped'));
     if (this.socket) {
       const socket = this.socket;
       if (this.isNodeWebSocket(socket)) {
@@ -200,6 +205,48 @@ export class CodexAppServerClient
       child.kill();
       this.child = null;
     }
+  }
+
+  private clearHeartbeat(): void {
+    if (!this.heartbeatTimer) return;
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+    this.missedHeartbeats = 0;
+  }
+
+  private startHeartbeat(socket: NodeWebSocket): void {
+    this.clearHeartbeat();
+    this.missedHeartbeats = 0;
+    socket.on('pong', () => {
+      this.missedHeartbeats = 0;
+    });
+    this.heartbeatTimer = setInterval(() => {
+      if (socket.readyState !== NodeWebSocket.OPEN) {
+        this.clearHeartbeat();
+        return;
+      }
+      this.missedHeartbeats += 1;
+      if (this.missedHeartbeats > 2) {
+        this.logger.warn('codex.app-server.socket_runtime_error', 'Heartbeat timeout');
+        socket.terminate();
+        this.clearHeartbeat();
+        return;
+      }
+      try {
+        socket.ping();
+      } catch {
+        socket.terminate();
+        this.clearHeartbeat();
+      }
+    }, CodexAppServerClient.SOCKET_HEARTBEAT_MS);
+  }
+
+  private rejectAllPending(error: Error): void {
+    if (this.pending.size === 0) return;
+    for (const [, resolver] of this.pending) {
+      resolver.reject(error);
+    }
+    this.pending.clear();
   }
 
   private async connectWebSocket(url: string): Promise<void> {
@@ -253,6 +300,7 @@ export class CodexAppServerClient
           attempt: attempt + 1,
           url,
         });
+        this.startHeartbeat(socket);
         socket.on('message', (data: NodeWebSocket.RawData) => this.handleMessage(data.toString()));
         socket.on('close', (code, reason) => {
           this.onSocketClosed(code, reason.toString());
@@ -337,6 +385,8 @@ export class CodexAppServerClient
 
   private onSocketClosed(code: number, reason: string): void {
     this.ready = false;
+    this.clearHeartbeat();
+    this.rejectAllPending(new Error(`Codex app-server socket closed (${code}) ${reason}`));
     this.logger.warn('codex.app-server.socket_closed', { code, reason });
     this.emit('notification', {
       method: 'error',
@@ -361,11 +411,20 @@ export class CodexAppServerClient
     }
 
     if ('id' in parsed && 'method' in parsed) {
+      this.logger.info('codex.request.incoming', {
+        method: parsed.method,
+        threadId: (parsed as { params?: { threadId?: unknown; conversationId?: unknown } }).params?.threadId,
+      });
       this.emit('request', parsed);
       return;
     }
 
     if ('method' in parsed) {
+      this.logger.info('codex.notification.incoming', {
+        method: parsed.method,
+        threadId: (parsed as { params?: { threadId?: unknown; conversationId?: unknown } }).params?.threadId,
+        turnId: (parsed as { params?: { turnId?: unknown } }).params?.turnId,
+      });
       this.emit('notification', parsed);
     }
   }
@@ -401,6 +460,12 @@ export class CodexAppServerClient
       ...(params ? { params } : {}),
     });
 
+    this.logger.info('codex.request', {
+      method,
+      threadId: params?.threadId,
+      turnId: params?.turnId,
+    });
+
     const result = await new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       if (this.isNodeWebSocket(socket)) {
@@ -417,6 +482,12 @@ export class CodexAppServerClient
         this.pending.delete(id);
         reject(toError(error));
       }
+    });
+
+    this.logger.info('codex.response', {
+      method,
+      threadId: params?.threadId,
+      turnId: params?.turnId,
     });
 
     return result as T;

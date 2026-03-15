@@ -1,0 +1,9 @@
+# Example project-level Codex config for this repo.
+# Copy to `.codex/config.toml` and adjust paths if needed.
+
+[mcp_servers.host-control]
+command = "bun"
+args = ["./src/bin/host-control-mcp.ts"]
+
+[mcp_servers.host-control.env]
+BRIDGE_HOST_CONTROL_CONFIG = "./data/host-control.runtime.json"

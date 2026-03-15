@@ -22,6 +22,7 @@ import { createHostControlProvider } from '../../host-control/index.js';
 import { isAllowedCwd, parseSlashCommand } from '../../utils.js';
 
 export class SessionOrchestrator {
+  private static readonly STREAM_FLUSH_MS = 2500;
   private readonly config: BridgeConfig;
   private readonly logger: LoggerLike;
   private readonly store: SqliteStore;
@@ -33,6 +34,7 @@ export class SessionOrchestrator {
   private readonly turnTypingStates = new Map<string, { messageId: string; reactionId: string | null }>();
   private readonly hostProvider;
   private readonly hostPolicy: HostControlPolicy;
+  private runtimeRecoveryInProgress = false;
 
   constructor(input: {
     config: BridgeConfig;
@@ -56,10 +58,14 @@ export class SessionOrchestrator {
 
   async start(): Promise<void> {
     this.runtime.onNotification(message => {
-      void this.handleNotification(message);
+      void this.handleNotification(message).catch(error => {
+        this.logger.error('bridge.notification_error', String((error as Error)?.stack || error));
+      });
     });
     this.runtime.onRequest(message => {
-      void this.handleServerRequest(message);
+      void this.handleServerRequest(message).catch(error => {
+        this.logger.error('bridge.server_request_error', String((error as Error)?.stack || error));
+      });
     });
   }
 
@@ -118,70 +124,94 @@ export class SessionOrchestrator {
     await this.adapter.removeReaction(state.messageId, state.reactionId);
   }
 
+  private errorSummary(error: unknown): string {
+    const message = String((error as Error)?.message || error || 'Unknown error');
+    return message.length > 260 ? `${message.slice(0, 257)}...` : message;
+  }
+
   async handleEnvelope(envelope: IncomingEnvelope): Promise<void> {
     this.logger.info('bridge.incoming', envelope);
+    try {
+      if (!this.isSenderAllowed(envelope.senderId)) {
+        await this.adapter.sendMessage(envelope.chatId, '## Answer\nThis sender is not allowed to control this host.');
+        return;
+      }
 
-    if (!this.isSenderAllowed(envelope.senderId)) {
-      await this.adapter.sendMessage(envelope.chatId, '## Answer\nThis sender is not allowed to control this host.');
-      return;
-    }
+      if (envelope.type === 'action') {
+        await this.handleActionEnvelope(envelope);
+        return;
+      }
 
-    if (envelope.type === 'action') {
-      await this.handleActionEnvelope(envelope);
-      return;
-    }
-
-    const binding = this.store.getBinding(envelope.chatId);
-    const slash = parseSlashCommand(envelope.text);
-    if (slash) {
-      const handled = await handleSlashCommand({
-        adapter: this.adapter,
-        runtime: this.runtime,
-        logger: this.logger,
-        chatId: envelope.chatId,
-        senderId: envelope.senderId,
-        slash,
-        binding,
-        ensureThread: async () => this.ensureThread(envelope, binding),
-        switchWorkspace: async workspaceId => this.createNewThreadBinding(envelope, workspaceId),
-        updateBinding: next => this.saveBinding(next),
-        listWorkspaces: () => this.config.workspaces,
-        findWorkspace: workspaceId => this.findWorkspace(workspaceId),
-        actions: this.config.actions,
-        hostProvider: this.hostProvider,
-        hostPolicy: this.hostPolicy,
-        pendingRequest: this.store.getPendingRequest(envelope.chatId),
-      });
-      if (handled) return;
-    }
-
-    const pending = this.store.getPendingRequest(envelope.chatId);
-    if (pending) {
-      await this.replyToPending(envelope, pending);
-      return;
-    }
-
-    if (binding?.save_file_next && envelope.attachments?.length) {
-      this.saveBinding({ ...binding, save_file_next: false });
-      envelope.attachments.forEach(item => {
-        this.store.saveAttachment({
+      const binding = this.store.getBinding(envelope.chatId);
+      const slash = parseSlashCommand(envelope.text);
+      if (slash) {
+        const handled = await handleSlashCommand({
+          adapter: this.adapter,
+          runtime: this.runtime,
+          logger: this.logger,
           chatId: envelope.chatId,
-          messageId: envelope.messageId,
-          filePath: item.localPath,
-          mimeType: item.mimeType,
-          isImage: item.kind === 'image',
+          senderId: envelope.senderId,
+          slash,
+          binding,
+          ensureThread: async () => this.ensureThread(envelope, binding),
+          switchWorkspace: async workspaceId => this.createNewThreadBinding(envelope, workspaceId),
+          updateBinding: next => this.saveBinding(next),
+          listWorkspaces: () => this.config.workspaces,
+          findWorkspace: workspaceId => this.findWorkspace(workspaceId),
+          actions: this.config.actions,
+          hostProvider: this.hostProvider,
+          hostPolicy: this.hostPolicy,
+          pendingRequest: this.store.getPendingRequest(envelope.chatId),
         });
+        if (handled) return;
+      }
+
+      const pending = this.store.getPendingRequest(envelope.chatId);
+      if (pending) {
+        await this.replyToPending(envelope, pending);
+        return;
+      }
+
+      if (binding?.save_file_next && envelope.attachments?.length) {
+        this.saveBinding({ ...binding, save_file_next: false });
+        envelope.attachments.forEach(item => {
+          this.store.saveAttachment({
+            chatId: envelope.chatId,
+            messageId: envelope.messageId,
+            filePath: item.localPath,
+            mimeType: item.mimeType,
+            isImage: item.kind === 'image',
+          });
+        });
+        await this.adapter.sendMessage(
+          envelope.chatId,
+          `## Answer\nSaved ${envelope.attachments.length} file(s):\n${envelope.attachments
+            .map(item => item.localPath)
+            .join('\n')}`,
+        );
+        return;
+      }
+
+      await this.routeTurn(envelope, binding);
+    } catch (error) {
+      this.logger.error('bridge.handle_envelope_error', {
+        chatId: envelope.chatId,
+        messageId: 'messageId' in envelope ? envelope.messageId : null,
+        error: String((error as Error)?.stack || error),
       });
-      await this.adapter.sendMessage(
-        envelope.chatId,
-        `## Answer\nSaved ${envelope.attachments.length} file(s):\n${envelope.attachments
-          .map(item => item.localPath)
-          .join('\n')}`,
-      );
+      try {
+        await this.adapter.sendMessage(
+          envelope.chatId,
+          `## Status\nRequest failed.\n\n## Answer\n${this.errorSummary(error)}`,
+        );
+      } catch (notifyError) {
+        this.logger.error('bridge.handle_envelope_error_notify_failed', {
+          chatId: envelope.chatId,
+          error: String((notifyError as Error)?.stack || notifyError),
+        });
+      }
       return;
     }
-
-    await this.routeTurn(envelope, binding);
   }
 
   private async createNewThreadBinding(
@@ -269,6 +299,12 @@ export class SessionOrchestrator {
     binding: ChatBinding | null,
   ): Promise<void> {
     const current = await this.ensureThread(envelope, binding);
+    this.logger.info('bridge.route_turn', {
+      chatId: envelope.chatId,
+      messageId: envelope.messageId,
+      threadId: current.thread_id,
+      state: current.state,
+    });
     const typingState = await this.addTypingIndicator(envelope.messageId);
     try {
       const inputs = toCodexInputs(envelope);
@@ -340,6 +376,12 @@ export class SessionOrchestrator {
           cwd,
           model: current.model || workspace.default_model,
         });
+        this.logger.info('bridge.turn_started', {
+          chatId: envelope.chatId,
+          threadId: current.thread_id,
+          turnId: response.turn.id,
+          status: response.turn.status,
+        });
       } catch (error) {
         if (!this.isThreadNotFoundError(error)) throw error;
         this.hydratedThreadIds.delete(current.thread_id);
@@ -349,6 +391,12 @@ export class SessionOrchestrator {
           input: inputs,
           cwd: recovered.cwd || cwd,
           model: recovered.model || workspace.default_model,
+        });
+        this.logger.info('bridge.turn_started', {
+          chatId: envelope.chatId,
+          threadId: recovered.thread_id,
+          turnId: response.turn.id,
+          status: response.turn.status,
         });
         this.saveBinding({
           ...recovered,
@@ -514,14 +562,37 @@ export class SessionOrchestrator {
     const buffer = this.turnBuffers.get(turnId);
     const binding = this.store.findBindingByThread(threadId);
     if (!buffer || !binding) return;
-
-    if (!buffer.messageId) {
-      buffer.messageId = await this.adapter.sendMessage(binding.chat_id, buffer.markdown(), {
-        replyToMessageId: buffer.replyToMessageId || undefined,
+    try {
+      if (!buffer.messageId) {
+        buffer.messageId = await this.adapter.sendMessage(binding.chat_id, buffer.markdown(), {
+          replyToMessageId: buffer.replyToMessageId || undefined,
+        });
+        return;
+      }
+      await this.adapter.editMessage(binding.chat_id, buffer.messageId, buffer.markdown());
+    } catch (error) {
+      this.logger.error('bridge.flush_turn_error', {
+        threadId,
+        turnId,
+        chatId: binding.chat_id,
+        messageId: buffer.messageId,
+        error: String((error as Error)?.stack || error),
       });
-      return;
+      try {
+        await this.adapter.sendMessage(
+          binding.chat_id,
+          `## Status\nFailed to update turn output.\n\n## Answer\n${this.errorSummary(error)}`,
+        );
+      } catch (notifyError) {
+        this.logger.error('bridge.flush_turn_error_notify_failed', {
+          chatId: binding.chat_id,
+          threadId,
+          turnId,
+          error: String((notifyError as Error)?.stack || notifyError),
+        });
+      }
+      throw error;
     }
-    await this.adapter.editMessage(binding.chat_id, buffer.messageId, buffer.markdown());
   }
 
   private scheduleFlush(threadId: string, turnId: string): void {
@@ -530,11 +601,16 @@ export class SessionOrchestrator {
     buffer.timer = setTimeout(async () => {
       buffer.timer = null;
       await this.flushTurn(threadId, turnId);
-    }, 600);
+    }, SessionOrchestrator.STREAM_FLUSH_MS);
   }
 
   private async handleNotification(message: ServerNotificationMessage): Promise<void> {
     this.logger.debug('codex.notification', message);
+
+    if (message.method === 'error') {
+      await this.handleRuntimeDisconnect(String(message.params.message || 'Codex app-server disconnected'));
+      return;
+    }
 
     if (message.method === 'turn/started') {
       const binding = this.store.findBindingByThread(String(message.params.threadId || ''));
@@ -582,16 +658,71 @@ export class SessionOrchestrator {
       const binding = this.store.findBindingByThread(String(message.params.threadId || ''));
       const turn = (message.params.turn || {}) as Record<string, unknown>;
       const turnIdValue = String(turn.id || '');
-      await this.flushTurn(String(message.params.threadId || ''), turnIdValue);
-      await this.clearTypingIndicator(turnIdValue);
-      this.turnBuffers.delete(turnIdValue);
-      if (binding) {
+      try {
+        await this.flushTurn(String(message.params.threadId || ''), turnIdValue);
+      } finally {
+        await this.clearTypingIndicator(turnIdValue);
+        this.turnBuffers.delete(turnIdValue);
+        if (binding) {
+          this.saveBinding({
+            ...binding,
+            active_turn_id: null,
+            state: 'idle',
+          });
+        }
+      }
+    }
+  }
+
+  private async handleRuntimeDisconnect(reason: string): Promise<void> {
+    if (this.runtimeRecoveryInProgress) return;
+    this.runtimeRecoveryInProgress = true;
+    try {
+      this.logger.warn('bridge.runtime_recovering', { error: reason });
+
+      const running = this.store.listRunningBindings();
+      for (const binding of running) {
+        if (binding.active_turn_id) {
+          await this.clearTypingIndicator(binding.active_turn_id);
+          const buffer = this.turnBuffers.get(binding.active_turn_id);
+          if (buffer?.timer) clearTimeout(buffer.timer);
+          this.turnBuffers.delete(binding.active_turn_id);
+        }
         this.saveBinding({
           ...binding,
           active_turn_id: null,
           state: 'idle',
         });
+        try {
+          await this.adapter.sendMessage(
+            binding.chat_id,
+            '## Status\nCodex app-server disconnected while streaming.\n\n## Answer\nThe runtime was restarted automatically. Please resend your last message.',
+          );
+        } catch (notifyError) {
+          this.logger.warn('bridge.runtime_recover_notify_failed', {
+            chatId: binding.chat_id,
+            error: String((notifyError as Error)?.stack || notifyError),
+          });
+        }
       }
+
+      try {
+        await this.runtime.stop();
+      } catch (error) {
+        this.logger.warn('bridge.runtime_recover_stop_failed', {
+          error: String((error as Error)?.stack || error),
+        });
+      }
+
+      try {
+        await this.runtime.start();
+      } catch (error) {
+        this.logger.error('bridge.runtime_recover_start_failed', {
+          error: String((error as Error)?.stack || error),
+        });
+      }
+    } finally {
+      this.runtimeRecoveryInProgress = false;
     }
   }
 

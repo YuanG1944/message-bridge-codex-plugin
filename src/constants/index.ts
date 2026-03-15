@@ -64,5 +64,6 @@ export const BRIDGE_COMMANDS = [
   '/cancel',
   '/sendfile <path>',
   '/savefile',
+  '/cache [status|prune|clear]',
   '/host status|tools',
 ] as const;

@@ -4,12 +4,23 @@ import http from 'node:http';
 import path from 'node:path';
 import { marked, Renderer } from 'marked';
 import type { IncomingEnvelope, FeishuAdapterCtor, FeishuApiOptions, FeishuCard, FeishuCardKit } from '../types.js';
+import { loadDetailPayload } from './detail-cache.js';
 import { safeJsonParse, verifyFeishuRequest } from './signature.js';
 
 type LarkModule = typeof import('@larksuiteoapi/node-sdk');
 const FEISHU_CALLBACK_PATH = '/feishu/webhook';
 const LOCAL_FILE_VIEW_PATH = '/bridge/file';
 const LOCAL_DETAIL_VIEW_PATH = '/bridge/detail';
+const FEISHU_HTTP_TIMEOUT_MS = 15_000;
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.svg': 'image/svg+xml',
+};
 
 function escapeHtml(text: string): string {
   return text
@@ -399,11 +410,16 @@ export class FeishuClient {
   private async getTenantToken(): Promise<string> {
     if (this.tenantToken && this.tenantTokenExpiresAt > Date.now() + 60_000) return this.tenantToken;
 
+    this.logger.info('feishu.api.request', {
+      method: 'POST',
+      url: '/open-apis/auth/v3/tenant_access_token/internal',
+    });
     const response = await fetch(
       'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        signal: AbortSignal.timeout(FEISHU_HTTP_TIMEOUT_MS),
         body: JSON.stringify({
           app_id: this.config.app_id,
           app_secret: this.config.app_secret,
@@ -411,6 +427,11 @@ export class FeishuClient {
       },
     );
     const body = (await response.json()) as Record<string, unknown>;
+    this.logger.info('feishu.api.response', {
+      method: 'POST',
+      url: '/open-apis/auth/v3/tenant_access_token/internal',
+      code: Number(body.code || response.status),
+    });
     if (!response.ok || body.code !== 0) {
       throw new Error(`Failed to refresh Feishu tenant token: ${JSON.stringify(body)}`);
     }
@@ -516,20 +537,37 @@ export class FeishuClient {
     options: FeishuApiOptions = {},
   ): Promise<Record<string, unknown>> {
     const token = await this.getTenantToken();
-    const response = await fetch(`https://open.feishu.cn${pathname}`, {
-      method: options.method || 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(options.contentType ? { 'Content-Type': options.contentType } : {}),
-      },
-      body: options.body,
-    });
-    const text = await response.text();
-    const payload = safeJsonParse<Record<string, unknown>>(text, { code: -1, msg: text });
-    if (!response.ok || payload.code !== 0) {
-      throw new Error(`Feishu API ${pathname} failed: ${text.slice(0, 500)}`);
+    const method = options.method || 'GET';
+    this.logger.info('feishu.api.request', { method, url: pathname });
+    try {
+      const response = await fetch(`https://open.feishu.cn${pathname}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(options.contentType ? { 'Content-Type': options.contentType } : {}),
+        },
+        signal: AbortSignal.timeout(FEISHU_HTTP_TIMEOUT_MS),
+        body: options.body,
+      });
+      const text = await response.text();
+      const payload = safeJsonParse<Record<string, unknown>>(text, { code: -1, msg: text });
+      this.logger.info('feishu.api.response', {
+        method,
+        url: pathname,
+        code: Number(payload.code || response.status),
+      });
+      if (!response.ok || payload.code !== 0) {
+        throw new Error(`Feishu API ${pathname} failed: ${text.slice(0, 500)}`);
+      }
+      return payload;
+    } catch (error) {
+      this.logger.error('feishu.api.error', {
+        method,
+        url: pathname,
+        error: String((error as Error)?.stack || error),
+      });
+      throw error;
     }
-    return payload;
   }
 
   async sendMessage(
@@ -971,8 +1009,20 @@ export class FeishuClient {
         return;
       }
 
-      const content = await fs.readFile(resolvedPath, 'utf8');
       const extension = path.extname(resolvedPath).toLowerCase();
+      const imageMime = IMAGE_MIME_BY_EXT[extension] || '';
+      if (imageMime) {
+        const buffer = await fs.readFile(resolvedPath);
+        res.writeHead(200, {
+          'Content-Type': imageMime,
+          'Cache-Control': 'no-store',
+          'Content-Length': String(buffer.byteLength),
+        });
+        res.end(buffer);
+        return;
+      }
+
+      const content = await fs.readFile(resolvedPath, 'utf8');
       const isJson = extension === '.json';
       const isMarkdown = extension === '.md';
       const title = `${path.basename(resolvedPath)}${line ? `:${line}` : ''}`;
@@ -1022,12 +1072,14 @@ export class FeishuClient {
   private async handleDetailRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
       const url = new URL(req.url || LOCAL_DETAIL_VIEW_PATH, 'http://127.0.0.1');
-      const title = url.searchParams.get('title') || 'Detail';
-      const kind = url.searchParams.get('kind') || 'detail';
-      const content = decodeBase64Url(url.searchParams.get('content') || '');
+      const ref = url.searchParams.get('ref') || '';
+      const cached = ref ? loadDetailPayload(ref) : null;
+      const title = cached?.title || url.searchParams.get('title') || 'Detail';
+      const kind = cached?.kind || url.searchParams.get('kind') || 'detail';
+      const content = cached?.content || decodeBase64Url(url.searchParams.get('content') || '');
       if (!content) {
         res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('missing content');
+        res.end(ref ? 'detail expired, regenerate from chat card' : 'missing content');
         return;
       }
 

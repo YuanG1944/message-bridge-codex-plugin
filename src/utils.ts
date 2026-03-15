@@ -25,7 +25,11 @@ export function safeJsonParse<T>(input: string, fallback: T): T {
 }
 
 export function parseSlashCommand(input: string): SlashCommand | null {
-  const text = String(input || '').trim();
+  const text = String(input || '')
+    .trim()
+    // Group chats often prefix commands with mentions like "@codex /help".
+    .replace(/^(?:@\S+\s+)+/, '')
+    .trim();
   if (!text.startsWith('/')) return null;
   const body = text.slice(1).trim();
   if (!body) return null;

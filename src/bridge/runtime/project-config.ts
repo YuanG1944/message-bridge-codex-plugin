@@ -18,8 +18,9 @@ export async function writeProjectCodexConfig(input: {
     .access(distScript)
     .then(() => distScript)
     .catch(() => sourceScript);
-  const command =
-    scriptPath.endsWith('.ts') && !process.versions.bun ? 'bun' : process.execPath;
+  // Use the Bun command name for TypeScript entrypoints so the generated
+  // Codex project config stays portable across macOS/Linux installs.
+  const command = scriptPath.endsWith('.ts') ? 'bun' : process.execPath;
 
   const content = [
     '[mcp_servers.host-control]',

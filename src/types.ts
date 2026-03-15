@@ -265,6 +265,7 @@ export type SqliteStatements = {
   insertAudit: Statement;
   listAudit: Statement;
   findByThread: Statement;
+  listRunningBindings: Statement;
 };
 
 export type SqliteStoreFields = {

@@ -48,6 +48,61 @@ bun run dev
 /help
 ```
 
+## First-Time Initialization
+
+When you run this project on a new machine for the first time, make sure these are configured before debugging runtime issues:
+
+1. Codex login and CLI:
+
+```bash
+codex --version
+codex login status
+```
+
+2. Local config file:
+
+- Create `bridge.config.local.json` from the example.
+- Fill real values for:
+  - `feishu.app_id`
+  - `feishu.app_secret`
+  - `feishu.callback_url`
+  - `feishu.verification_token`
+  - `feishu.signing_secret`
+
+3. Feishu event/callback mode:
+
+- In Feishu Developer Console, enable long connection receive mode (`ws`) for message events.
+- Configure callback URL (HTTPS) for card actions and verification.
+
+4. Codex trusted project (recommended):
+
+- If logs show project `.codex/config.toml` is ignored, mark this repo as trusted in `~/.codex/config.toml`.
+- Create project config from the example:
+
+```bash
+cp .codex/config.example.toml .codex/config.toml
+```
+
+- Add:
+
+```toml
+[projects."/absolute/path/to/message-bridge-codex-plugin"]
+trust_level = "trusted"
+```
+
+5. Start and smoke test:
+
+```bash
+bun run dev
+```
+
+Then verify in Feishu:
+
+- `/status`
+- `/host status`
+- `/new`
+- A simple prompt like `只回复OK`
+
 ## Feishu Setup
 
 This project works best in `ws` mode for message receive events, but it still starts a local callback server for webhook verification and card action callbacks. That means you should configure both:

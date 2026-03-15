@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { button, commandCard, markdownCard } from '../feishu/ui/cards.js';
+import { clearDetailCache, getDetailCacheStats, pruneDetailCache } from '../feishu/detail-cache.js';
 import { HostControlPolicy } from '../host-control/policy.js';
 import type {
   BridgeAction,
@@ -233,6 +234,7 @@ export async function handleSlashCommand(ctx: CommandContext): Promise<boolean> 
           '/cancel - 取消当前等待中的请求',
           '/sendfile <path> - 把本地文件发到飞书',
           '/savefile - 下一条上传的文件会直接保存到本机',
+          '/cache [status|prune|clear] - 管理详情页正文缓存',
           '/host status|tools - 查看主机状态或可用宿主工具',
         ].join('\n'),
       ].join('\n\n'),
@@ -433,6 +435,37 @@ export async function handleSlashCommand(ctx: CommandContext): Promise<boolean> 
       await sendCommandMessage(renderHostStatus(status));
       return true;
     }
+  }
+
+  if (slash.command === 'cache') {
+    const sub = args.trim().toLowerCase() || 'status';
+    if (sub === 'status') {
+      const stats = getDetailCacheStats();
+      await sendCommandMessage(
+        [
+          '### Cache',
+          `- entries: ${stats.entries}`,
+          `- ttl_ms: ${stats.ttlMs}`,
+          `- max_entries: ${stats.maxEntries}`,
+        ].join('\n'),
+      );
+      return true;
+    }
+    if (sub === 'prune') {
+      const removed = pruneDetailCache();
+      const stats = getDetailCacheStats();
+      await sendCommandMessage(
+        `Pruned ${removed} detail cache entries. Remaining: ${stats.entries}`,
+      );
+      return true;
+    }
+    if (sub === 'clear') {
+      const removed = clearDetailCache();
+      await sendCommandMessage(`Cleared ${removed} detail cache entries.`);
+      return true;
+    }
+    await sendCommandMessage('Usage: /cache [status|prune|clear]');
+    return true;
   }
 
   if (slash.command === 'approve' || slash.command === 'deny' || slash.command === 'cancel') {

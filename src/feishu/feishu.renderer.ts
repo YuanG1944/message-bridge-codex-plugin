@@ -1,5 +1,6 @@
 import type { FeishuCard, FeishuCardKit } from '../types.js';
 import { sanitizeTemplateMarkers } from '../utils.js';
+import { saveDetailPayload } from './detail-cache.js';
 import { optimizeMarkdownStyle } from './ui/markdown-style.js';
 
 type FeishuCardElement = Record<string, unknown>;
@@ -16,6 +17,16 @@ type ParsedSections = {
 
 const STREAMING_ELEMENT_ID = 'streaming_content';
 const DETAIL_VIEW_PATH = '/bridge/detail';
+const CARD_SECTION_LIMITS = {
+  status: 400,
+  thinking: 1600,
+  answer: 3500,
+  commands: 1200,
+  files: 1200,
+  tools: 1200,
+  authorization: 600,
+  input: 600,
+} as const;
 
 function trimSafe(value: string): string {
   return String(value || '').trim();
@@ -34,10 +45,9 @@ function buildDetailViewUrl(
   params: { title: string; content: string; kind: string },
 ): string {
   if (!callbackUrl) return '#';
+  const ref = saveDetailPayload(params);
   const url = new URL(DETAIL_VIEW_PATH, callbackUrl);
-  url.searchParams.set('title', params.title);
-  url.searchParams.set('kind', params.kind);
-  url.searchParams.set('content', Buffer.from(params.content, 'utf8').toString('base64url'));
+  url.searchParams.set('ref', ref);
   return url.toString();
 }
 
@@ -131,6 +141,25 @@ function parseSections(markdown: string): ParsedSections {
   }
 
   return sections;
+}
+
+function clampText(value: string, limit: number): string {
+  const text = trimSafe(value);
+  if (!text || text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 24)).trimEnd()}\n\n...[truncated]`;
+}
+
+function clampSections(sections: ParsedSections): ParsedSections {
+  return {
+    status: clampText(sections.status, CARD_SECTION_LIMITS.status),
+    thinking: clampText(sections.thinking, CARD_SECTION_LIMITS.thinking),
+    answer: clampText(sections.answer, CARD_SECTION_LIMITS.answer),
+    commands: clampText(sections.commands, CARD_SECTION_LIMITS.commands),
+    files: clampText(sections.files, CARD_SECTION_LIMITS.files),
+    tools: clampText(sections.tools, CARD_SECTION_LIMITS.tools),
+    authorization: clampText(sections.authorization, CARD_SECTION_LIMITS.authorization),
+    input: clampText(sections.input, CARD_SECTION_LIMITS.input),
+  };
 }
 
 function formatElapsed(ms: number): string {
@@ -468,7 +497,7 @@ function buildCompleteCard(sections: ParsedSections, callbackUrl: string | null)
 }
 
 function buildCard(markdown: string, callbackUrl: string | null): FeishuCard {
-  const sections = parseSections(markdown);
+  const sections = clampSections(parseSections(markdown));
   const hasAnswer = Boolean(trimSafe(sections.answer));
   const hasStreamingData =
     Boolean(trimSafe(sections.thinking)) ||

@@ -70,6 +70,17 @@ web_modules/
 .env.*
 !.env.example
 bridge.config.local.json
+bridge.config.example copy*.json
+
+# Bridge runtime/local state
+.codex/config.toml
+!.codex/config.example.toml
+data/bridge.db
+data/bridge.db-shm
+data/bridge.db-wal
+data/host-control.runtime.json
+data/files/
+data/captures/
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache

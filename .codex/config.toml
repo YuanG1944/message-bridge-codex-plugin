@@ -1,6 +1,0 @@
-[mcp_servers.host-control]
-command = "/home/yuan/.nvm/versions/node/v22.19.0/lib/node_modules/bun/bin/bun.exe"
-args = ["/home/yuan/repo/message-bridge-codex-plugin/dist/src/bin/host-control-mcp.js"]
-
-[mcp_servers.host-control.env]
-BRIDGE_HOST_CONTROL_CONFIG = "/home/yuan/repo/message-bridge-codex-plugin/data/host-control.runtime.json"

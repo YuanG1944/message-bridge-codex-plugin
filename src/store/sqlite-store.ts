@@ -113,6 +113,9 @@ export class SqliteStore {
       `),
       listAudit: this.db.prepare('SELECT * FROM audit_log WHERE chat_id = ? ORDER BY id DESC LIMIT ?'),
       findByThread: this.db.prepare('SELECT * FROM chat_binding WHERE thread_id = ? LIMIT 1'),
+      listRunningBindings: this.db.prepare(
+        "SELECT * FROM chat_binding WHERE state IN ('turn_running', 'awaiting_approval', 'awaiting_user_input')",
+      ),
     };
   }
 
@@ -144,6 +147,14 @@ export class SqliteStore {
       plan_mode: Boolean(row.plan_mode),
       save_file_next: Boolean(row.save_file_next),
     };
+  }
+
+  listRunningBindings(): ChatBinding[] {
+    return (this.statements.listRunningBindings.all() as Array<Record<string, unknown>>).map(row => ({
+      ...(row as unknown as ChatBinding),
+      plan_mode: Boolean(row.plan_mode),
+      save_file_next: Boolean(row.save_file_next),
+    }));
   }
 
   saveBinding(binding: ChatBinding): void {
